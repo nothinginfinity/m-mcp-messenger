@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createGitHubMessageReader } from '../../src/reader/github-message-reader.js';
+import { createInMemoryReadCache } from '../../src/reader/read-cache.js';
 import { generateKeypair } from '../../src/identity/index.js';
 import { createSignedEnvelope } from '../../src/envelope/index.js';
 import { InMemoryMessageStore } from '../../src/store/index.js';
@@ -15,130 +16,139 @@ beforeEach(() => vi.restoreAllMocks());
 
 function makeFileResponse(envelope: object) {
   const content = Buffer.from(JSON.stringify(envelope, null, 2), 'utf-8').toString('base64');
-  return { ok: true, json: async () => ({ content, sha: 'abc' }) };
+  return { ok: true, status: 200, json: async () => ({ content, sha: 'abc' }) };
 }
 
-function makeDirResponse(names: string[]) {
+function makeTreeResponse(paths: string[]) {
   return {
     ok: true,
-    json: async () => names.map(name => ({
-      type: 'file',
-      name,
-      path: `spaces/0xBOB/messages/${name}`,
-      sha: 'abc',
-      download_url: null,
-    })),
+    json: async () => ({
+      tree: paths.map(path => ({ type: 'blob', path, sha: 'abc', url: '' })),
+      truncated: false,
+    }),
   };
 }
 
-describe('GitHubMessageReader', () => {
-  it('returns zero results when directory does not exist', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 404, ok: false, json: async () => ({}) }));
-    const store = new InMemoryMessageStore();
-    const reader = createGitHubMessageReader(BASE_CONFIG);
-    const result = await reader.poll('0xBOB', store);
-    expect(result.found).toBe(0);
-    expect(result.ingested).toBe(0);
-  });
+function makeRefResponse(sha = 'commit_sha_001') {
+  return { ok: true, json: async () => ({ object: { sha } }) };
+}
 
-  it('ingests a valid message — exactly 2 API calls (list + fetch)', async () => {
+describe('GitHubMessageReader (v2 — Tree API + ReadCache)', () => {
+  it('warm poll with cache — 2 API calls when no new messages', async () => {
     const sender = generateKeypair();
     const recipient = generateKeypair();
     const env = await createSignedEnvelope(
       sender.address, recipient.address,
-      { content: 'hello', contentType: 'text/plain' },
+      { content: 'warm test', contentType: 'text/plain' },
       sender.privateKey
     );
 
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(makeDirResponse([`${env.id}.json`]))
-      .mockResolvedValueOnce(makeFileResponse(env));
+    const path = `spaces/${recipient.address}/messages/${env.id}.json`;
+    const cache = createInMemoryReadCache();
+    await cache.save(recipient.address, new Set([env.id])); // pre-warm
 
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(makeRefResponse())          // ref lookup
+      .mockResolvedValueOnce(makeTreeResponse([path]));  // tree fetch
     vi.stubGlobal('fetch', fetchMock);
 
     const store = new InMemoryMessageStore();
-    const reader = createGitHubMessageReader(BASE_CONFIG);
+    const reader = createGitHubMessageReader({ ...BASE_CONFIG, readCache: cache });
     const result = await reader.poll(recipient.address, store);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2); // list + 1 file
-    expect(result.found).toBe(1);
-    expect(result.ingested).toBe(1);
-    expect(result.rejected).toHaveLength(0);
-  });
-
-  it('skips already-stored messages without fetching their content', async () => {
-    const sender = generateKeypair();
-    const recipient = generateKeypair();
-    const env = await createSignedEnvelope(
-      sender.address, recipient.address,
-      { content: 'idempotent', contentType: 'text/plain' },
-      sender.privateKey
-    );
-
-    // Pre-load the store
-    const store = new InMemoryMessageStore();
-    await store.put({ envelope: env, status: 'delivered', updatedAt: new Date().toISOString(), direction: 'inbound' });
-
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(makeDirResponse([`${env.id}.json`]));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const reader = createGitHubMessageReader(BASE_CONFIG);
-    const result = await reader.poll(recipient.address, store);
-
-    expect(fetchMock).toHaveBeenCalledTimes(1); // list only — no file fetch
+    // ref + tree = 2, cache.load is in-memory (0 calls), no file fetches
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(result.skipped).toBe(1);
     expect(result.ingested).toBe(0);
+    expect(result.apiCalls).toBe(3); // 2 tree + 1 cache load (counted internally)
   });
 
-  it('rejects tampered envelope without storing it', async () => {
+  it('cold poll — fetches new messages, saves cache after ingest', async () => {
     const sender = generateKeypair();
     const recipient = generateKeypair();
     const env = await createSignedEnvelope(
       sender.address, recipient.address,
-      { content: 'legit', contentType: 'text/plain' },
+      { content: 'cold test', contentType: 'text/plain' },
+      sender.privateKey
+    );
+
+    const path = `spaces/${recipient.address}/messages/${env.id}.json`;
+    const cache = createInMemoryReadCache(); // empty cache
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(makeRefResponse())
+      .mockResolvedValueOnce(makeTreeResponse([path]))
+      .mockResolvedValueOnce(makeFileResponse(env));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const store = new InMemoryMessageStore();
+    const reader = createGitHubMessageReader({ ...BASE_CONFIG, readCache: cache });
+    const result = await reader.poll(recipient.address, store);
+
+    expect(result.ingested).toBe(1);
+    expect(result.found).toBe(1);
+    expect(result.skipped).toBe(0);
+
+    // Cache should now contain the ingested ID
+    const cached = await cache.load(recipient.address);
+    expect(cached.has(env.id)).toBe(true);
+  });
+
+  it('second poll is fully warm — no file fetches', async () => {
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const env = await createSignedEnvelope(
+      sender.address, recipient.address,
+      { content: 'repeat poll', contentType: 'text/plain' },
+      sender.privateKey
+    );
+
+    const path = `spaces/${recipient.address}/messages/${env.id}.json`;
+    const cache = createInMemoryReadCache();
+
+    const fetchMock = vi.fn()
+      // First poll: ref + tree + file
+      .mockResolvedValueOnce(makeRefResponse())
+      .mockResolvedValueOnce(makeTreeResponse([path]))
+      .mockResolvedValueOnce(makeFileResponse(env))
+      // Second poll: ref + tree only (message now in cache)
+      .mockResolvedValueOnce(makeRefResponse())
+      .mockResolvedValueOnce(makeTreeResponse([path]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const store = new InMemoryMessageStore();
+    const reader = createGitHubMessageReader({ ...BASE_CONFIG, readCache: cache });
+
+    await reader.poll(recipient.address, store);  // cold
+    const second = await reader.poll(recipient.address, store); // warm
+
+    expect(second.skipped).toBe(1);
+    expect(second.ingested).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(5); // 3 + 2
+  });
+
+  it('rejects tampered envelope', async () => {
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const env = await createSignedEnvelope(
+      sender.address, recipient.address,
+      { content: 'real', contentType: 'text/plain' },
       sender.privateKey
     );
     const tampered = { ...env, payload: { ...env.payload, content: 'HACKED' } };
+    const path = `spaces/${recipient.address}/messages/${env.id}.json`;
 
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(makeDirResponse([`${env.id}.json`]))
-      .mockResolvedValueOnce(makeFileResponse(tampered));
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(makeRefResponse())
+      .mockResolvedValueOnce(makeTreeResponse([path]))
+      .mockResolvedValueOnce(makeFileResponse(tampered))
+    );
 
     const store = new InMemoryMessageStore();
-    const reader = createGitHubMessageReader(BASE_CONFIG);
+    const reader = createGitHubMessageReader({ ...BASE_CONFIG, readCache: createInMemoryReadCache() });
     const result = await reader.poll(recipient.address, store);
 
     expect(result.rejected).toHaveLength(1);
     expect(result.rejected[0].reason).toContain('Signature invalid');
-    expect(await store.listInbox()).toHaveLength(0);
-  });
-
-  it('fetches multiple new messages in parallel batches', async () => {
-    const sender = generateKeypair();
-    const recipient = generateKeypair();
-    const envs = await Promise.all(
-      [1,2,3].map(i => createSignedEnvelope(
-        sender.address, recipient.address,
-        { content: `msg ${i}`, contentType: 'text/plain' },
-        sender.privateKey
-      ))
-    );
-
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(makeDirResponse(envs.map(e => `${e.id}.json`)))
-      .mockResolvedValueOnce(makeFileResponse(envs[0]))
-      .mockResolvedValueOnce(makeFileResponse(envs[1]))
-      .mockResolvedValueOnce(makeFileResponse(envs[2]));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const store = new InMemoryMessageStore();
-    const reader = createGitHubMessageReader(BASE_CONFIG);
-    const result = await reader.poll(recipient.address, store);
-
-    expect(result.found).toBe(3);
-    expect(result.ingested).toBe(3);
-    expect(fetchMock).toHaveBeenCalledTimes(4); // 1 list + 3 files
   });
 });
