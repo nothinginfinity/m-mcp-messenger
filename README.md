@@ -39,6 +39,44 @@ A signed receipt proving a message was created by a specific agent on a specific
 ### Local-first delivery
 Messages are stored and delivered on-device by default. Remote relay is opt-in, policy-gated, and never required for the common case.
 
+## Transport architecture
+
+Delivery is handled by pluggable `RelayTransport` implementations. Two are provided today:
+
+| Transport | Send cost | Read cost | Best for |
+|---|---|---|---|
+| `GitHubSpacesTransport` | 2 calls (GET + PUT) | 1 call | Low volume, human-readable inboxes |
+| `GitHubMessageTransport` | **1 call (PUT only)** | 1 list + N new files | Agent-to-agent, high volume |
+
+### ReadCache
+
+`GitHubMessageTransport` pairs with a `ReadCache` to make repeated polls cheap. After the first poll, all seen message IDs are cached — subsequent polls against an unchanged inbox cost **2 API calls** regardless of inbox size.
+
+Two implementations:
+- `createInMemoryReadCache()` — session-scoped, zero API calls
+- `createGitHubReadCache()` — persists across sessions as `spaces/{address}/.read-cache.json`
+
+### Tree API
+
+Message directory listing uses the GitHub Tree API (`GET /git/trees/{sha}?recursive=1`) rather than the Contents API. This returns the full subtree in a single call and is more cache-friendly at GitHub's CDN layer.
+
+### Future: Edge Worker Index (planned)
+
+> **Roadmap note.** When message volume or polling frequency grows to the point where GitHub API rate limits become a constraint, the right next layer is a lightweight **Cloudflare Worker** (or equivalent edge function) acting as a message index in front of the repo.
+>
+> **How it would work:**
+> - The worker watches the repo via a GitHub webhook
+> - On each new message commit, it updates an in-memory or KV-backed index keyed by recipient address
+> - Spaces poll `GET https://your-worker.workers.dev/index/{address}` instead of hitting GitHub directly
+> - Response is a flat JSON array of message IDs: `["msg_001", "msg_002", ...]`
+> - The worker response is globally cached at Cloudflare's edge — reads are ~10ms anywhere in the world
+> - Spaces still fetch individual message files from GitHub for content (provenance preserved)
+> - A single `POST /flush/{address}` endpoint can trigger a forced re-index
+>
+> **Why not now:** The ReadCache + Tree API combination already makes warm polls cost 2 GitHub API calls. The edge worker becomes worth adding when you have many agents polling frequently, or when you want to remove the GitHub token requirement from read operations entirely (the worker can serve public index data without auth).
+>
+> **Implementation estimate:** ~50 lines of Worker code + one `wrangler deploy`. No new protocol changes required — it's a drop-in replacement for the Tree API step inside `GitHubMessageReader`.
+
 ## What this repo does
 
 - Ethereum-style keypair generation (on-device, no seed phrase in v1)
