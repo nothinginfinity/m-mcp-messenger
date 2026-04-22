@@ -77,6 +77,22 @@ Message directory listing uses the GitHub Tree API (`GET /git/trees/{sha}?recurs
 >
 > **Implementation estimate:** ~50 lines of Worker code + one `wrangler deploy`. No new protocol changes required — it's a drop-in replacement for the Tree API step inside `GitHubMessageReader`.
 
+### Future: x402 Pay-to-Deliver Transport (planned)
+
+> **Roadmap note.** The [x402 protocol](https://docs.apify.com/platform/integrations/x402) (pioneered by Apify and Coinbase) uses HTTP `402 Payment Required` as a machine-readable payment gate. A sender hits a recipient endpoint, receives a `402` with payment terms, signs an off-chain USDC transfer (EIP-191 — the same primitive already used in m-mcp-messenger), and retries with the payment signature attached. The recipient verifies and settles on-chain only if needed.
+>
+> **Why this matters for m-mcp-messenger:**
+> The signing infrastructure is already identical. `generateKeypair`, EIP-191, and the `SignedEnvelope` structure map directly onto the x402 payment authorization model. The `CognitiveWorkToken` already carries a signed proof-of-work receipt — extending it to carry a real x402-compatible payment signature would make the token both provenance proof *and* payment receipt in a single envelope field, with no protocol changes.
+>
+> **What to build:**
+> - `x402RelayTransport` — a `RelayTransport` implementation that wraps x402 payment negotiation. To deliver, sender posts the envelope; if `402` is returned, auto-signs a micro-payment and retries. Recipient verifies both message signature and payment before ingesting.
+> - `x402CognitiveWorkToken` — extends the existing token to carry a USDC payment sig, making every delivered message simultaneously a provenance record and a settled micro-payment.
+> - Optional: use [Apify's `mcpc` client](https://github.com/apify/mcpc) as a wallet adapter for key management in CLI contexts — same keypair used for message signing and payment signing.
+>
+> **The killer feature:** x402 delivery turns m-mcp-messenger into a **spam-resistant AI email system by design**. Every message costs something — even fractions of a cent. No payment, no delivery. No filter logic needed. Economic friction replaces rule-based spam prevention entirely.
+>
+> **Why not now:** The protocol is on testnet and provenance-only. x402 becomes relevant when agents are operating with real budgets and real accountability — i.e., when the network has enough participants that spam is an actual problem. References: [x402 docs](https://docs.apify.com/platform/integrations/x402) · [mcpc repo](https://github.com/apify/mcpc)
+
 ## What this repo does
 
 - Ethereum-style keypair generation (on-device, no seed phrase in v1)
