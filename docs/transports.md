@@ -1,92 +1,63 @@
-# Relay Transports
+# Transports
 
-## Overview
+Two `RelayTransport` implementations are provided. Both use GitHub as relay.
+Choose based on your throughput and latency requirements.
 
-A `RelayTransport` is a pluggable delivery mechanism for remote message relay.
-It is only used when local delivery is not possible and the execution policy permits remote calls.
+## Transport Comparison
 
-The transport interface is intentionally minimal:
+| | GitHubSpacesTransport | GitHubMessageTransport |
+|---|---|---|
+| **Send cost** | 2 API calls (GET + PUT) | 1 API call (PUT only) |
+| **Read cost** | 1 API call | 1 + N calls (list + new files) |
+| **Conflict risk** | Yes (append merge) | None (immutable files) |
+| **Human readable** | Single inbox.md | Per-message JSON files |
+| **Best for** | Low volume, human browsing | High volume, agent-to-agent |
 
-```ts
-interface RelayTransport {
-  send(envelope: SignedEnvelope): Promise<RelayResult>;
-}
+## GitHubMessageTransport (Recommended)
+
+Each message is written as its own file:
+```
+spaces/{recipientAddress}/messages/{messageId}.json
 ```
 
-The envelope is already signed before it reaches the transport.
-The transport is responsible only for delivery — not for trust or verification.
-The recipient always re-verifies the signature on receipt.
-
-## Built-in transports
-
-### `noopRelayTransport`
-
-The safe default. Always returns `success: false` with a message pointing to the interface.
-Used when no transport is configured.
-
-### `GitHubSpacesTransport`
-
-Delivers messages by appending signed envelopes to a GitHub-hosted inbox file.
-
-Matches the existing `spaces/*/inbox.md` pattern used in Studio-OS-Chat and Studio-OS.
-
+### Send — 1 API call
 ```ts
-import { createGitHubSpacesTransport } from 'm-mcp-messenger';
+import { createGitHubMessageTransport } from 'm-mcp-messenger';
 
-const transport = createGitHubSpacesTransport({
+const transport = createGitHubMessageTransport({
   owner: 'nothinginfinity',
   repo: 'Studio-OS-Chat',
   branch: 'main',
   token: process.env.GITHUB_TOKEN,
-  // Optional: override default path convention
-  resolveInboxPath: (address) => `spaces/${address}/inbox.md`,
 });
+
+// Single PUT — no SHA needed, no prior GET
+await transport.deliver(signedEnvelope);
 ```
 
-**Inbox path convention (default):**
-```
-spaces/{recipientAddress}/inbox.md
-```
-
-**Message format in inbox file:**
-```markdown
-<!-- m-mcp-messenger envelope msg_123 delivered 2026-04-21T07:00:00.000Z -->
-```json
-{
-  "id": "msg_123",
-  "from": "0xSENDER...",
-  "to": "0xRECIPIENT...",
-  ...
-}
-```
-
-**Security model:**
-- The envelope is signed by the sender (EIP-191) before transport
-- GitHub commit provides delivery timestamp proof
-- GitHub is trusted for transport only — never for authenticity
-- Recipient verifies sender signature independently on read
-
-## Implementing a custom transport
-
+### Receive — 1 list + N new files (parallel)
 ```ts
-import type { RelayTransport } from 'm-mcp-messenger';
+import { createGitHubMessageReader } from 'm-mcp-messenger';
 
-const myTransport: RelayTransport = {
-  async send(envelope) {
-    // your delivery logic here
-    return { success: true, messageId: envelope.id };
-  },
-};
+const reader = createGitHubMessageReader({
+  owner: 'nothinginfinity',
+  repo: 'Studio-OS-Chat',
+  branch: 'main',
+  token: process.env.GITHUB_TOKEN,
+  concurrency: 5, // parallel file fetches
+});
+
+const result = await reader.poll(myAddress, store);
+// Already-seen messages skipped before any file fetch
 ```
 
-Any transport can be passed to `relayDeliver()`:
+## GitHubSpacesTransport (Legacy)
 
-```ts
-await relayDeliver(envelope, { allowRemote: true }, myTransport);
-```
+Appends to a single `inbox.md` per recipient. Simpler to browse as a human
+but requires GET→merge→PUT per send. Use for low-volume or human-readable inboxes.
 
-## Planned transports
+## Security Model (Both Transports)
 
-- `IPFSTransport` — content-addressed delivery, no central server
-- `WebSocketTransport` — real-time relay for online agents
-- `StudioOSChatTransport` — direct integration with Studio-OS-Chat spaces
+GitHub is trusted for **transport only, never for authenticity**.
+Every envelope is verified via EIP-191 signature by the reader before ingestion.
+A compromised GitHub account cannot inject a valid message without the sender's private key.
